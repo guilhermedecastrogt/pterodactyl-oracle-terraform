@@ -1,0 +1,82 @@
+diff --git a/controllers/LibraryController.php b/controllers/LibraryController.php
+index 195f6bc..a949a58 100644
+--- a/controllers/LibraryController.php
++++ b/controllers/LibraryController.php
+@@ -60,6 +60,11 @@ class LibraryController extends Controller
+ 
+     public function setProvider(Request $request): JsonResponse
+     {
++        // The provider is a panel-wide setting, not a per-server one.
++        if (!$request->user()->root_admin) {
++            return new JsonResponse(['message' => 'Only administrators can change the provider.'], 403);
++        }
++
+         $provider = $request->input('provider');
+         if (!in_array($provider, LibraryProviderRegistry::ids(), true)) {
+             return new JsonResponse(['message' => "Unknown provider: {$provider}"], 422);
+@@ -426,6 +431,11 @@ class LibraryController extends Controller
+ 
+     private function tryDatapackCommand(Server $server, string $action, string $filename): void
+     {
++        // A newline would end this console command and start another one.
++        if (preg_match('/[\x00-\x1F\x7F]/', $filename)) {
++            return;
++        }
++
+         $safeFilename = str_replace('"', '\\"', $filename);
+ 
+         try {
+diff --git a/routes/client.php b/routes/client.php
+index 5ffde8a..9eafee8 100644
+--- a/routes/client.php
++++ b/routes/client.php
+@@ -2,23 +2,31 @@
+ 
+ use Illuminate\Support\Facades\Route;
+ use Pterodactyl\BlueprintFramework\Extensions\mclibrarymgr;
++use Pterodactyl\Http\Middleware\Activity\ServerSubject;
++use Pterodactyl\Http\Middleware\Api\Client\Server\AuthenticateServerAccess;
++use Pterodactyl\Http\Middleware\Api\Client\Server\ResourceBelongsToServer;
+ 
+-Route::get('/servers/{server}/provider', [mclibrarymgr\LibraryController::class, 'provider']);
+-Route::post('/servers/{server}/provider', [mclibrarymgr\LibraryController::class, 'setProvider']);
+-Route::get('/servers/{server}/search', [mclibrarymgr\LibraryController::class, 'search']);
+-Route::get('/servers/{server}/versions', [mclibrarymgr\LibraryController::class, 'versions']);
+-Route::get('/servers/{server}/installed', [mclibrarymgr\LibraryController::class, 'installed']);
+-Route::post('/servers/{server}/identify-batch', [mclibrarymgr\LibraryController::class, 'identifyBatch']);
+-Route::get('/servers/{server}/details', [mclibrarymgr\LibraryController::class, 'details']);
+-Route::post('/servers/{server}/install', [mclibrarymgr\LibraryController::class, 'install']);
+-Route::delete('/servers/{server}/uninstall', [mclibrarymgr\LibraryController::class, 'uninstall']);
++// Blueprint mounts extension client routes without the middleware that core
++// /api/client/servers/{server} routes get, so apply the same access checks
++// here and gate each action on the matching subuser file permission.
++Route::middleware([ServerSubject::class, AuthenticateServerAccess::class, ResourceBelongsToServer::class])->group(function () {
++    Route::get('/servers/{server}/provider', [mclibrarymgr\LibraryController::class, 'provider']);
++    Route::post('/servers/{server}/provider', [mclibrarymgr\LibraryController::class, 'setProvider']);
++    Route::get('/servers/{server}/search', [mclibrarymgr\LibraryController::class, 'search']);
++    Route::get('/servers/{server}/versions', [mclibrarymgr\LibraryController::class, 'versions']);
++    Route::get('/servers/{server}/installed', [mclibrarymgr\LibraryController::class, 'installed'])->middleware('can:file.read,server');
++    Route::post('/servers/{server}/identify-batch', [mclibrarymgr\LibraryController::class, 'identifyBatch'])->middleware('can:file.read-content,server');
++    Route::get('/servers/{server}/details', [mclibrarymgr\LibraryController::class, 'details']);
++    Route::post('/servers/{server}/install', [mclibrarymgr\LibraryController::class, 'install'])->middleware('can:file.create,server');
++    Route::delete('/servers/{server}/uninstall', [mclibrarymgr\LibraryController::class, 'uninstall'])->middleware('can:file.delete,server');
+ 
+-Route::get('/servers/{server}/modpacks/search', [mclibrarymgr\ModpackController::class, 'search']);
+-Route::get('/servers/{server}/modpacks/versions', [mclibrarymgr\ModpackController::class, 'versions']);
+-Route::get('/servers/{server}/modpacks/installed', [mclibrarymgr\ModpackController::class, 'installed']);
+-Route::post('/servers/{server}/modpacks/manifest', [mclibrarymgr\ModpackController::class, 'manifest']);
+-Route::post('/servers/{server}/modpacks/install-entry', [mclibrarymgr\ModpackController::class, 'installEntry']);
+-Route::post('/servers/{server}/modpacks/install-server-pack', [mclibrarymgr\ModpackController::class, 'installServerPack']);
+-Route::post('/servers/{server}/modpacks/finalize', [mclibrarymgr\ModpackController::class, 'finalize']);
+-Route::delete('/servers/{server}/modpacks/uninstall', [mclibrarymgr\ModpackController::class, 'uninstall']);
+-Route::post('/servers/{server}/modpacks/failure-log', [mclibrarymgr\ModpackController::class, 'failureLog']);
++    Route::get('/servers/{server}/modpacks/search', [mclibrarymgr\ModpackController::class, 'search']);
++    Route::get('/servers/{server}/modpacks/versions', [mclibrarymgr\ModpackController::class, 'versions']);
++    Route::get('/servers/{server}/modpacks/installed', [mclibrarymgr\ModpackController::class, 'installed'])->middleware('can:file.read,server');
++    Route::post('/servers/{server}/modpacks/manifest', [mclibrarymgr\ModpackController::class, 'manifest'])->middleware('can:file.create,server');
++    Route::post('/servers/{server}/modpacks/install-entry', [mclibrarymgr\ModpackController::class, 'installEntry'])->middleware('can:file.create,server');
++    Route::post('/servers/{server}/modpacks/install-server-pack', [mclibrarymgr\ModpackController::class, 'installServerPack'])->middleware('can:file.create,server');
++    Route::post('/servers/{server}/modpacks/finalize', [mclibrarymgr\ModpackController::class, 'finalize'])->middleware('can:file.create,server');
++    Route::delete('/servers/{server}/modpacks/uninstall', [mclibrarymgr\ModpackController::class, 'uninstall'])->middleware('can:file.delete,server');
++    Route::post('/servers/{server}/modpacks/failure-log', [mclibrarymgr\ModpackController::class, 'failureLog'])->middleware('can:file.create,server');
++});

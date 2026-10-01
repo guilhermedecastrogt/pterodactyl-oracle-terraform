@@ -115,6 +115,21 @@ variable "panel_domain" {
   default     = ""
 }
 
+variable "panel_version" {
+  description = <<-EOT
+    Pterodactyl version, as a tag of ghcr.io/blueprintframework/blueprint (the
+    official panel image with the Blueprint extension framework added). Only
+    move it forward: the database migrates with the panel and cannot go back.
+  EOT
+  type        = string
+  default     = "v1.15.1"
+
+  validation {
+    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.panel_version))
+    error_message = "Use a release tag such as v1.15.1. A floating tag like latest could jump the panel ahead of its database."
+  }
+}
+
 variable "panel_admin_email" {
   description = "Email of the panel's first admin user. Also used for Let's Encrypt."
   type        = string

@@ -49,27 +49,36 @@ resource "oci_core_instance" "mc" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-
-    user_data = base64encode(templatefile("${path.module}/templates/cloud-init.yaml.tftpl", {
-      timezone               = var.timezone
-      region                 = var.region
-      panel_domain           = var.panel_domain
-      panel_admin_email      = var.panel_admin_email
-      panel_admin_username   = var.panel_admin_username
-      panel_admin_first_name = var.panel_admin_first_name
-      panel_admin_last_name  = var.panel_admin_last_name
-      panel_admin_password   = local.panel_admin_password
-      app_key                = local.app_key
-      db_root_password       = random_password.db_root.result
-      db_password            = random_password.db_user.result
-      game_port_min          = var.game_port_min
-      game_port_max          = var.game_port_max
-    }))
+    user_data           = base64gzip(local.cloud_init)
   }
 
   preserve_boot_volume = false
 
   lifecycle {
-    ignore_changes = [source_details[0].source_id]
+    # user_data only runs at first boot, and changing it would recreate the
+    # VM along with every game server on it. scripts/sync-bootstrap.sh pushes
+    # template changes to a running instance instead.
+    ignore_changes = [source_details[0].source_id, metadata["user_data"]]
   }
+}
+
+locals {
+  cloud_init = templatefile("${path.module}/templates/cloud-init.yaml.tftpl", {
+    timezone               = var.timezone
+    region                 = var.region
+    instance_name          = var.instance_name
+    panel_version          = var.panel_version
+    panel_domain           = var.panel_domain
+    panel_admin_email      = var.panel_admin_email
+    panel_admin_username   = var.panel_admin_username
+    panel_admin_first_name = var.panel_admin_first_name
+    panel_admin_last_name  = var.panel_admin_last_name
+    panel_admin_password   = local.panel_admin_password
+    app_key                = local.app_key
+    db_root_password       = random_password.db_root.result
+    db_password            = random_password.db_user.result
+    game_port_min          = var.game_port_min
+    game_port_max          = var.game_port_max
+    mclibrarymgr_patch     = file("${path.module}/templates/extensions/mclibrarymgr-authz.patch")
+  })
 }

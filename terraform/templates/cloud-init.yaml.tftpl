@@ -6,14 +6,18 @@ package_upgrade: false
 packages:
   - ca-certificates
   - curl
+  - git
   - htop
   - unzip
+  - zip
   - jq
 
 write_files:
   - path: /opt/pterodactyl/docker-compose.yml
     permissions: "0644"
     content: |
+      name: pterodactyl
+
       x-common:
         database: &db-env
           MYSQL_PASSWORD: &db-password "${db_password}"
@@ -42,7 +46,10 @@ write_files:
           restart: always
 
         panel:
-          image: ghcr.io/pterodactyl/panel:latest
+          # The official panel image with Blueprint, the extension framework,
+          # built in. Pinned: the tag is the Pterodactyl version underneath,
+          # and the database must never run ahead of the panel code.
+          image: ghcr.io/blueprintframework/blueprint:${panel_version}
           container_name: panel
           restart: always
           depends_on:
@@ -69,9 +76,13 @@ write_files:
             REDIS_HOST: cache
             MAIL_MAILER: log
           volumes:
+            # Blueprint rewrites the panel code when it installs an extension,
+            # so /app lives in a named volume that survives container restarts.
+            - app:/app
             - ./data/panel/var:/app/var
             - ./data/panel/logs:/app/storage/logs
             - ./data/panel/nginx:/etc/nginx/http.d
+            - ./data/extensions:/blueprint_extensions
 
         wings:
           image: ghcr.io/pterodactyl/wings:latest
@@ -95,6 +106,9 @@ write_files:
             - /var/lib/pterodactyl:/var/lib/pterodactyl
             - /var/log/pterodactyl:/var/log/pterodactyl
             - /tmp/pterodactyl:/tmp/pterodactyl
+            # Wings writes a machine-id file per server here and bind-mounts
+            # it into the game container, so the path must exist on the host.
+            - /run/wings:/run/wings
             - /etc/ssl/certs:/etc/ssl/certs:ro
 
         proxy:
@@ -110,73 +124,286 @@ write_files:
             - ./Caddyfile:/etc/caddy/Caddyfile:ro
             - ./data/caddy:/data
 
+      volumes:
+        app:
+
+  # Restricts the Library Manager's routes to users who can reach the server,
+  # with the matching file permission. Applied on top of the pinned commit.
+  - path: /opt/pterodactyl/extensions/mclibrarymgr-authz.patch
+    permissions: "0644"
+    encoding: b64
+    content: ${base64encode(mclibrarymgr_patch)}
+
   - path: /opt/pterodactyl/bootstrap.sh
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
-      # Runs once at first boot, and is safe to run again by hand.
+      # Runs once at first boot, and is safe to run again by hand:
+      #   sudo bash /opt/pterodactyl/bootstrap.sh
+      # Every step checks before acting, so a re-run never deletes servers,
+      # volumes, certificates or secrets, and skips what is already in place.
       set -euo pipefail
 
       cd /opt/pterodactyl
+      mkdir -p logs
 
-      # The public IP is only known after the VM exists, so resolve it here
-      # rather than in Terraform.
-      PUBLIC_IP=$(curl -s -H "Authorization: Bearer Oracle" \
-        http://169.254.169.254/opc/v2/vnics/ | jq -r '.[0].publicIp')
+      ok() { printf '[OK] %s\n' "$*"; }
+      info() { printf '     %s\n' "$*"; }
+      fail() {
+        printf '[ERROR] %s\n  reason: %s\n  look at: %s\n  action: %s\n' "$1" "$2" "$3" "$4" >&2
+        exit 1
+      }
+      artisan() { docker compose exec -T panel php artisan "$@"; }
+      running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
+
+      # Third-party Blueprint extensions, pinned so a re-run installs exactly the
+      # same code. Bump a pin deliberately, then re-run this script to upgrade.
+      SIDEBAR_URL="https://github.com/zephrynis/ptero-sidebar/releases/download/1.0/sidebar.blueprint"
+      SIDEBAR_SHA256="acd7653e2b804eea06be3aad49a6f97b9a11590d4a4bfd71cf4e5882616241af"
+      MCLIB_REPO="https://github.com/nicolasjm0702/mclibrarymgr"
+      MCLIB_COMMIT="0797d8771e2a9dc3a95be6907a4081ecfb33ec56"
+      MCLIB_PATCH="/opt/pterodactyl/extensions/mclibrarymgr-authz.patch"
+      PANEL_IMAGE="ghcr.io/blueprintframework/blueprint:${panel_version}"
+
+      # --- Docker -----------------------------------------------------------------
+      docker info >/dev/null 2>&1 \
+        || fail Docker "the Docker daemon is not answering" "journalctl -u docker" "systemctl restart docker, then re-run this script"
+      ok Docker
+
+      # --- Public address ---------------------------------------------------------
+      # Oracle's instance metadata only lists private addresses, so ask outside.
+      PUBLIC_IP=""
+      for lookup in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        candidate=$(curl -fsS --max-time 10 "$lookup" 2>/dev/null | tr -d '[:space:]') || true
+        if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          PUBLIC_IP="$candidate"
+          break
+        fi
+      done
+      [ -n "$PUBLIC_IP" ] \
+        || fail "Public IP" "no IP lookup service answered" "curl -v https://api.ipify.org" "check the VM's outbound internet access, then re-run this script"
 
       CONFIGURED_DOMAIN="${panel_domain}"
-      if [ -n "$${CONFIGURED_DOMAIN}" ]; then
-        BASE_DOMAIN="$${CONFIGURED_DOMAIN}"
+      if [ -n "$CONFIGURED_DOMAIN" ]; then
+        BASE_DOMAIN="$CONFIGURED_DOMAIN"
       else
         # sslip.io resolves any name containing an IP straight back to it,
         # which gives us real DNS (and therefore real certificates) with no
         # domain to register.
-        BASE_DOMAIN="$${PUBLIC_IP}.sslip.io"
+        BASE_DOMAIN="$PUBLIC_IP.sslip.io"
       fi
+      NODE_FQDN="node.$BASE_DOMAIN"
 
-      echo "BASE_DOMAIN=$${BASE_DOMAIN}" > .env
-      echo "PUBLIC_IP=$${PUBLIC_IP}" >> .env
+      echo "BASE_DOMAIN=$BASE_DOMAIN" > .env
+      echo "PUBLIC_IP=$PUBLIC_IP" >> .env
 
       cat > Caddyfile <<EOF
       {
         email ${panel_admin_email}
       }
 
-      panel.$${BASE_DOMAIN} {
+      panel.$BASE_DOMAIN {
         reverse_proxy panel:80
       }
 
-      node.$${BASE_DOMAIN} {
+      $NODE_FQDN {
         reverse_proxy wings:8080
       }
       EOF
 
-      mkdir -p data/panel/var data/panel/logs data/panel/nginx data/database data/caddy
-      mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl
+      mkdir -p data/panel/var data/panel/logs data/panel/nginx data/database data/caddy data/extensions
+      mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl /run/wings
 
-      docker compose up -d
+      # --- Panel image ------------------------------------------------------------
+      # The app volume holds the code of the image it was created from. After a
+      # version bump it must be rebuilt from the new image, and the extensions
+      # installed again on top (they live in that volume too).
+      if [ -f data/.panel-image ] && [ "$(cat data/.panel-image)" != "$PANEL_IMAGE" ]; then
+        info "panel image changed to $PANEL_IMAGE, rebuilding the app volume"
+        docker compose rm -sf panel
+        docker volume rm pterodactyl_app >/dev/null 2>&1 || true
+      fi
 
-      echo "waiting for the panel to finish migrating"
+      docker compose up -d >logs/compose-up.log 2>&1 \
+        || fail "Docker Compose" "docker compose up failed" "/opt/pterodactyl/logs/compose-up.log" "fix the error shown there, then re-run this script"
+      echo "$PANEL_IMAGE" > data/.panel-image
+
+      # --- MariaDB / Redis --------------------------------------------------------
       for _ in $(seq 1 60); do
-        if docker compose exec -T panel php artisan migrate:status >/dev/null 2>&1; then
+        [ "$(docker inspect -f '{{.State.Health.Status}}' panel-database 2>/dev/null)" = "healthy" ] && break
+        sleep 5
+      done
+      [ "$(docker inspect -f '{{.State.Health.Status}}' panel-database 2>/dev/null)" = "healthy" ] \
+        || fail MariaDB "panel-database never became healthy" "docker logs panel-database" "check that data/database is owned by uid 999, then re-run this script"
+      ok MariaDB
+
+      running panel-cache \
+        || fail Redis "panel-cache is not running" "docker logs panel-cache" "docker compose up -d cache"
+      ok Redis
+
+      # --- Pterodactyl ------------------------------------------------------------
+      # The image's entrypoint migrates the database before it starts nginx, so
+      # the panel answering HTTP means its own migrations are done. Blueprint
+      # never runs extension migrations inside Docker, so finish those here.
+      served=false
+      for _ in $(seq 1 90); do
+        if docker compose exec -T panel wget -q -O /dev/null http://127.0.0.1/auth/login 2>/dev/null; then
+          served=true
           break
         fi
         sleep 10
       done
+      $served \
+        || fail Pterodactyl "the panel never started serving" "docker logs --tail 50 panel" "check the database credentials and data/panel/logs, then re-run this script"
+      migrate_database() {
+        artisan migrate --force >>logs/migrate.log 2>&1 \
+          && ! artisan migrate:status 2>/dev/null | grep -q Pending \
+          || fail Pterodactyl "database migrations did not finish" "/opt/pterodactyl/logs/migrate.log" "docker compose exec panel php artisan migrate --force"
+      }
+      migrate_database
 
-      # p:user:make fails if the account already exists, which is fine on a re-run.
-      docker compose exec -T panel php artisan p:user:make \
-        --email="${panel_admin_email}" \
-        --username="${panel_admin_username}" \
-        --name-first="${panel_admin_first_name}" \
-        --name-last="${panel_admin_last_name}" \
-        --password="${panel_admin_password}" \
-        --admin=1 --no-interaction || true
+      # Only on the first run: the password may have been changed in the panel since.
+      if ! artisan tinker --execute='echo \Pterodactyl\Models\User::where("username", "${panel_admin_username}")->exists() ? "exists" : "missing";' 2>/dev/null | grep -q exists; then
+        artisan p:user:make \
+          --email="${panel_admin_email}" \
+          --username="${panel_admin_username}" \
+          --name-first="${panel_admin_first_name}" \
+          --name-last="${panel_admin_last_name}" \
+          --password="${panel_admin_password}" \
+          --admin=1 --no-interaction >logs/admin-user.log 2>&1 \
+          || fail Pterodactyl "could not create the admin user" "/opt/pterodactyl/logs/admin-user.log" "create it with: docker compose exec panel php artisan p:user:make"
+      fi
 
-      docker compose exec -T panel php artisan p:location:make \
-        --short=oci --long="Oracle Cloud ${region}" --no-interaction || true
+      LOCATION_ID=$(artisan tinker --execute='echo \Pterodactyl\Models\Location::where("short", "oci")->value("id");' 2>/dev/null | tail -n1 | tr -dc '0-9') || true
+      if [ -z "$LOCATION_ID" ]; then
+        artisan p:location:make --short=oci --long="Oracle Cloud ${region}" --no-interaction >/dev/null
+        LOCATION_ID=$(artisan tinker --execute='echo \Pterodactyl\Models\Location::where("short", "oci")->value("id");' | tail -n1 | tr -dc '0-9')
+      fi
+      ok "Pterodactyl (admin ${panel_admin_username}, location oci)"
 
-      printf '\npanel ready at https://panel.%s\n' "$${BASE_DOMAIN}"
+      # --- Blueprint --------------------------------------------------------------
+      docker compose exec -T panel test -f /app/blueprint.sh \
+        || fail Blueprint "the panel image has no Blueprint" "docker compose images panel" "check panel_version: the image must be ghcr.io/blueprintframework/blueprint"
+      ok "Blueprint ($PANEL_IMAGE)"
+
+      # Installs an extension unless that exact build is already in place.
+      # $1 identifier, $2 display name, $3 build key (changes when the code does).
+      install_extension() {
+        local id="$1" name="$2" key="$3" log="logs/blueprint-$1.log"
+        if docker compose exec -T panel grep -q "|$id," /app/.blueprint/extensions/blueprint/private/db/installed_extensions 2>/dev/null \
+          && [ "$(cat "data/extensions/.$id.key" 2>/dev/null)" = "$key" ]; then
+          ok "$name (already installed)"
+          return
+        fi
+
+        # Copy it in ourselves rather than wait on the image's folder watcher.
+        docker compose cp "data/extensions/$id.blueprint" "panel:/app/$id.blueprint" >"$log" 2>&1 \
+          || fail "$name" "could not copy $id.blueprint into the panel" "/opt/pterodactyl/$log" "check that the panel container is running"
+        docker compose exec -T panel blueprint -i "$id" >>"$log" 2>&1 || true
+        docker compose exec -T panel grep -q "|$id," /app/.blueprint/extensions/blueprint/private/db/installed_extensions \
+          || fail "$name" "blueprint -i $id did not register the extension" "/opt/pterodactyl/$log" "fix the error in that log, then re-run this script"
+        migrate_database
+
+        echo "$key" > "data/extensions/.$id.key"
+        ok "$name"
+      }
+
+      if ! echo "$SIDEBAR_SHA256  data/extensions/sidebar.blueprint" | sha256sum -c --quiet >/dev/null 2>&1; then
+        curl -fsSL --retry 3 -o data/extensions/sidebar.blueprint.tmp "$SIDEBAR_URL" \
+          || fail "Ptero Sidebar" "download failed" "$SIDEBAR_URL" "check GitHub is reachable, then re-run this script"
+        echo "$SIDEBAR_SHA256  data/extensions/sidebar.blueprint.tmp" | sha256sum -c --quiet \
+          || fail "Ptero Sidebar" "checksum mismatch, refusing to install" "$SIDEBAR_URL" "verify the release upstream before updating SIDEBAR_SHA256"
+        mv data/extensions/sidebar.blueprint.tmp data/extensions/sidebar.blueprint
+      fi
+      install_extension sidebar "Ptero Sidebar" "$SIDEBAR_SHA256"
+
+      # No release ships a .blueprint, so build one from the pinned commit the same
+      # way the project's own build.sh does, with the access-control patch applied.
+      MCLIB_KEY="$MCLIB_COMMIT $(sha256sum "$MCLIB_PATCH" | cut -d' ' -f1)"
+      if [ "$(cat data/extensions/.mclibrarymgr.key 2>/dev/null)" != "$MCLIB_KEY" ] || [ ! -f data/extensions/mclibrarymgr.blueprint ]; then
+        src=$(mktemp -d)
+        {
+          git -C "$src" init -q
+          git -C "$src" fetch -q --depth 1 "$MCLIB_REPO" "$MCLIB_COMMIT"
+          git -C "$src" checkout -q FETCH_HEAD
+          git -C "$src" apply "$MCLIB_PATCH"
+        } >logs/mclibrarymgr-build.log 2>&1 \
+          || fail "Minecraft Library Manager" "could not fetch or patch commit $MCLIB_COMMIT" "/opt/pterodactyl/logs/mclibrarymgr-build.log" "if the patch no longer applies, refresh it against the new commit"
+        rm -f data/extensions/mclibrarymgr.blueprint
+        (cd "$src" && zip -qr /opt/pterodactyl/data/extensions/mclibrarymgr.blueprint . \
+          -x ".*/*" -x "docs/*" -x "*.blueprint" -x "build.sh" -x "build.ps1" -x "tests/*" \
+          -x "vendor/*" -x "node_modules/*" -x "composer.json" -x "composer.lock" -x "phpunit.xml")
+        rm -rf "$src"
+      fi
+      install_extension mclibrarymgr "Minecraft Library Manager" "$MCLIB_KEY"
+
+      # --- Wings ------------------------------------------------------------------
+      # Register this VM as a node once, then hand Wings its config. An existing
+      # node or config.yml is left alone, so manual changes in the panel survive.
+      NODE_ID=$(artisan p:node:list --format=json 2>/dev/null \
+        | jq -r --arg fqdn "$NODE_FQDN" '[.[] | select(.host | contains($fqdn))][0].id // empty') || true
+      if [ -z "$NODE_ID" ]; then
+        # Leave about 4 GB of memory and 10 GB of disk to the OS and the panel.
+        memory_mb=$(( $(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo) - 4096 ))
+        disk_mb=$(( $(df -BM --output=avail / | tail -n1 | tr -dc '0-9') - 10240 ))
+        artisan p:node:make --no-interaction \
+          --name="${instance_name}" --description="Oracle Cloud ${region}" --locationId="$LOCATION_ID" \
+          --fqdn="$NODE_FQDN" --public=1 --scheme=https --proxy=1 --maintenance=0 \
+          --maxMemory="$memory_mb" --overallocateMemory=0 --maxDisk="$disk_mb" --overallocateDisk=0 \
+          --uploadSize=100 --daemonListeningPort=443 --daemonSFTPPort=2022 \
+          --daemonBase=/var/lib/pterodactyl/volumes >logs/node-make.log 2>&1 \
+          || fail Wings "could not create the node" "/opt/pterodactyl/logs/node-make.log" "create it under Admin > Nodes instead"
+        NODE_ID=$(artisan p:node:list --format=json | jq -r --arg fqdn "$NODE_FQDN" '[.[] | select(.host | contains($fqdn))][0].id // empty') || true
+      fi
+      [ -n "$NODE_ID" ] \
+        || fail Wings "no node matches $NODE_FQDN" "docker compose exec panel php artisan p:node:list" "create the node under Admin > Nodes, then re-run this script"
+
+      # Game ports, shown to players as the public IP.
+      artisan tinker --execute='$node = \Pterodactyl\Models\Node::findOrFail('"$NODE_ID"'); if ($node->allocations()->count() === 0) { app(\Pterodactyl\Services\Allocations\AssignmentService::class)->handle($node, ["allocation_ip" => "0.0.0.0", "allocation_alias" => "'"$PUBLIC_IP"'", "allocation_ports" => ["${game_port_min}-${game_port_max}"]]); }' >/dev/null
+
+      if [ ! -f /etc/pterodactyl/config.yml ]; then
+        artisan p:node:configuration "$NODE_ID" --format=yaml > /tmp/wings-config.yml
+        # Caddy terminates TLS on 443 and proxies to Wings on 8080 inside the
+        # compose network. Wings' default 172.18.0.0/16 network is the one compose
+        # already took, so give it its own range.
+        python3 - /tmp/wings-config.yml <<'PY'
+      import sys, yaml
+      path = sys.argv[1]
+      config = yaml.safe_load(open(path))
+      config["api"]["port"] = 8080
+      config["api"]["ssl"]["enabled"] = False
+      config.setdefault("docker", {}).setdefault("network", {}).update({
+          "interface": "172.30.0.1",
+          "interfaces": {"v4": {"subnet": "172.30.0.0/16", "gateway": "172.30.0.1"}},
+      })
+      yaml.safe_dump(config, open(path, "w"), sort_keys=False)
+      PY
+        install -m 600 /tmp/wings-config.yml /etc/pterodactyl/config.yml
+        rm -f /tmp/wings-config.yml
+        docker compose restart wings >/dev/null 2>&1
+      fi
+
+      for _ in $(seq 1 12); do
+        [ "$(docker inspect -f '{{.State.Status}}' wings 2>/dev/null)" = "running" ] && sleep 5 \
+          && [ "$(docker inspect -f '{{.State.Status}}' wings 2>/dev/null)" = "running" ] && break
+        sleep 5
+      done
+      [ "$(docker inspect -f '{{.State.Status}}' wings 2>/dev/null)" = "running" ] \
+        || fail Wings "the wings container keeps restarting" "docker logs --tail 50 wings" "compare /etc/pterodactyl/config.yml with Admin > Nodes > Configuration"
+      ok "Wings (node $NODE_FQDN, ports ${game_port_min}-${game_port_max})"
+
+      # --- Caddy ------------------------------------------------------------------
+      running panel-proxy \
+        || fail Caddy "panel-proxy is not running" "docker logs panel-proxy" "docker compose up -d proxy"
+      for _ in $(seq 1 30); do
+        curl -fsk -o /dev/null --resolve "panel.$BASE_DOMAIN:443:127.0.0.1" "https://panel.$BASE_DOMAIN/auth/login" && break
+        sleep 5
+      done
+      curl -fsk -o /dev/null --resolve "panel.$BASE_DOMAIN:443:127.0.0.1" "https://panel.$BASE_DOMAIN/auth/login" \
+        || fail Caddy "the login page does not load through the proxy" "docker logs --tail 50 panel-proxy; docker logs --tail 50 panel" "check DNS for panel.$BASE_DOMAIN points here"
+      ok "Caddy (HTTPS for panel.$BASE_DOMAIN and $NODE_FQDN)"
+
+      printf '\npanel ready at https://panel.%s\n' "$BASE_DOMAIN"
 
   - path: /etc/profile.d/pterodactyl.sh
     permissions: "0644"
@@ -202,6 +429,8 @@ runcmd:
   - netfilter-persistent save || iptables-save > /etc/iptables/rules.v4
 
   - bash /opt/pterodactyl/bootstrap.sh
-  - chown -R ubuntu:ubuntu /opt/pterodactyl
+  # Only the files a human edits: data/ belongs to the containers (MariaDB
+  # refuses to start once its datadir is no longer owned by its own user).
+  - chown ubuntu:ubuntu /opt/pterodactyl /opt/pterodactyl/docker-compose.yml /opt/pterodactyl/Caddyfile /opt/pterodactyl/.env
 
 final_message: "Provisioning finished after $UPTIME seconds."
