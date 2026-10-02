@@ -9,8 +9,8 @@ database, the Wings daemon and an HTTPS reverse proxy — with a working
 certificate and an admin account already created.
 
 On top of Pterodactyl it installs [Blueprint](https://github.com/BlueprintFramework/framework)
-with two extensions, so it behaves like a small Minecraft hosting panel: a
-sidebar navigation, and **Library** / **Modpack** tabs on every server for
+with three extensions, so it behaves like a small Minecraft hosting panel: a
+sidebar navigation, a dark theme, and **Library** / **Modpack** tabs on every server for
 searching and installing mods, plugins, datapacks, resource packs and modpacks
 from Modrinth or CurseForge. SSH is for the infrastructure, not for adding a
 plugin. See [Minecraft Hosting Panel](#minecraft-hosting-panel).
@@ -34,7 +34,7 @@ terraform apply
                   └── docker compose up
                         ├── caddy      → TLS for panel.<domain> and node.<domain>
                         ├── panel      → Pterodactyl + Blueprint
-                        │                 (Ptero Sidebar, Minecraft Library Manager)
+                        │                 (Ptero Sidebar, Darkenate, Minecraft Library Manager)
                         ├── database   → MariaDB
                         ├── cache      → Redis
                         └── wings      → spawns one container per game server
@@ -148,6 +148,7 @@ with the reason, where to look and what to do:
 [OK] Pterodactyl (admin admin, location oci)
 [OK] Blueprint (ghcr.io/blueprintframework/blueprint:v1.15.1)
 [OK] Ptero Sidebar
+[OK] Darkenate theme
 [OK] Minecraft Library Manager
 [OK] Wings (node node.150.230.x.x.sslip.io, ports 25565-25585)
 [OK] Caddy (HTTPS for panel.150.230.x.x.sslip.io and node.150.230.x.x.sslip.io)
@@ -180,7 +181,8 @@ database rather than in Terraform, so it never lands in state or in Git.
 ## Minecraft Hosting Panel
 
 ```
-Pterodactyl  →  Blueprint  →  Ptero Sidebar
+Pterodactyl  →  Blueprint  →  Ptero Sidebar               (layout)
+                           →  Darkenate                   (colours)
                            →  Minecraft Library Manager  →  Library · Modpack tabs
 ```
 
@@ -188,11 +190,14 @@ Pterodactyl  →  Blueprint  →  Ptero Sidebar
 |---|---|---|
 | [Blueprint](https://github.com/BlueprintFramework/framework) | Extension framework. Ships as the official panel image with Blueprint added | `ghcr.io/blueprintframework/blueprint:<panel_version>`, amd64 + **arm64** |
 | [Ptero Sidebar](https://github.com/zephrynis/ptero-sidebar) | Replaces the top navigation with a sidebar. CSS only, no server code | release `1.0`, SHA-256 checked |
+| [Darkenate](https://github.com/blueprint-community/extension-darkenate) | Dark theme: one palette, rounded cards, restyled login. CSS only | release `v2.0.3`, SHA-256 checked |
 | [Minecraft Library Manager](https://github.com/nicolasjm0702/mclibrarymgr) | Adds **Library** and **Modpack** tabs to each server | commit `0797d87`, built from source + local patch |
 
-All three are free and open source (MIT, GPL-3.0, MPL-2.0). No theme is
-installed on top: the sidebar already changes the navigation, and a second
-navigation addon would fight it.
+All four are free and open source (MIT, GPL-3.0, MIT, MPL-2.0). The sidebar
+and the theme split the work: the sidebar only changes the layout of the
+navigation, Darkenate only its colours, so they do not fight. Neither loads
+anything from outside the panel. Keep it to one theme; two themes restyle the
+same elements and the last one installed wins unpredictably.
 
 **How it is installed.** `panel_version` selects the image. Blueprint rewrites
 the panel's code when it installs an extension, so `/app` lives in a named

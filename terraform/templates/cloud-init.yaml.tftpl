@@ -160,6 +160,8 @@ write_files:
       # same code. Bump a pin deliberately, then re-run this script to upgrade.
       SIDEBAR_URL="https://github.com/zephrynis/ptero-sidebar/releases/download/1.0/sidebar.blueprint"
       SIDEBAR_SHA256="acd7653e2b804eea06be3aad49a6f97b9a11590d4a4bfd71cf4e5882616241af"
+      DARKENATE_URL="https://github.com/blueprint-community/extension-darkenate/releases/download/v2.0.3/darkenate.blueprint"
+      DARKENATE_SHA256="4df955f057ab65e7bbae95773cd8f1185cd532d7dc4f4b738f5861c2a75d6508"
       MCLIB_REPO="https://github.com/nicolasjm0702/mclibrarymgr"
       MCLIB_COMMIT="0797d8771e2a9dc3a95be6907a4081ecfb33ec56"
       MCLIB_PATCH="/opt/pterodactyl/extensions/mclibrarymgr-authz.patch"
@@ -308,14 +310,24 @@ write_files:
         ok "$name"
       }
 
-      if ! echo "$SIDEBAR_SHA256  data/extensions/sidebar.blueprint" | sha256sum -c --quiet >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o data/extensions/sidebar.blueprint.tmp "$SIDEBAR_URL" \
-          || fail "Ptero Sidebar" "download failed" "$SIDEBAR_URL" "check GitHub is reachable, then re-run this script"
-        echo "$SIDEBAR_SHA256  data/extensions/sidebar.blueprint.tmp" | sha256sum -c --quiet \
-          || fail "Ptero Sidebar" "checksum mismatch, refusing to install" "$SIDEBAR_URL" "verify the release upstream before updating SIDEBAR_SHA256"
-        mv data/extensions/sidebar.blueprint.tmp data/extensions/sidebar.blueprint
-      fi
+      # Downloads a released .blueprint unless the copy on disk already matches.
+      # $1 identifier, $2 display name, $3 url, $4 expected sha256.
+      fetch_release() {
+        local id="$1" name="$2" url="$3" sha="$4" file="data/extensions/$1.blueprint"
+        echo "$sha  $file" | sha256sum -c --quiet >/dev/null 2>&1 && return
+        curl -fsSL --retry 3 -o "$file.tmp" "$url" \
+          || fail "$name" "download failed" "$url" "check GitHub is reachable, then re-run this script"
+        echo "$sha  $file.tmp" | sha256sum -c --quiet >/dev/null 2>&1 \
+          || fail "$name" "checksum mismatch, refusing to install" "$url" "verify the release upstream before updating its pinned sha256"
+        mv "$file.tmp" "$file"
+      }
+
+      fetch_release sidebar "Ptero Sidebar" "$SIDEBAR_URL" "$SIDEBAR_SHA256"
       install_extension sidebar "Ptero Sidebar" "$SIDEBAR_SHA256"
+
+      # CSS only, and it colours the navigation the sidebar lays out.
+      fetch_release darkenate "Darkenate theme" "$DARKENATE_URL" "$DARKENATE_SHA256"
+      install_extension darkenate "Darkenate theme" "$DARKENATE_SHA256"
 
       # No release ships a .blueprint, so build one from the pinned commit the same
       # way the project's own build.sh does, with the access-control patch applied.

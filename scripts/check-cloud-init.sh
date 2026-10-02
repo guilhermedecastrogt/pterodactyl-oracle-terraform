@@ -47,7 +47,7 @@ assert "app:/app" in compose["services"]["panel"]["volumes"], "Blueprint needs /
 assert "app" in compose["volumes"]
 
 bootstrap = files["/opt/pterodactyl/bootstrap.sh"]
-for needle in ["p:user:make", "blueprint -i", "MCLIB_COMMIT=", "SIDEBAR_SHA256=", "p:node:make"]:
+for needle in ["p:user:make", "blueprint -i", "MCLIB_COMMIT=", "SIDEBAR_SHA256=", "DARKENATE_SHA256=", "p:node:make"]:
     assert needle in bootstrap, f"bootstrap is missing {needle}"
 assert "${" not in bootstrap, "an unrendered Terraform interpolation leaked into the script"
 assert not any("chown -R" in str(c) for c in doc["runcmd"]), "a recursive chown would take MariaDB's datadir away from it"
