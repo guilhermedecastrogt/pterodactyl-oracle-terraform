@@ -45,10 +45,17 @@ assert compose["services"]["panel"]["environment"]["APP_URL"].startswith("https:
 assert compose["services"]["panel"]["image"] == "ghcr.io/blueprintframework/blueprint:v1.15.1"
 assert "app:/app" in compose["services"]["panel"]["volumes"], "Blueprint needs /app in a named volume"
 assert "app" in compose["volumes"]
+proxy = compose["services"]["proxy"]
+assert set(proxy["networks"]) == {"default", "edge"}, "the proxy must stay on the panel network and join the shared edge network"
+assert "./sites:/etc/caddy/sites:ro" in proxy["volumes"], "the proxy must import site definitions from ./sites"
+assert compose["networks"]["edge"] == {"name": "edge", "external": True}, "edge must be external so the panel never deletes it"
+assert all("networks" not in service for name, service in compose["services"].items() if name != "proxy"), "only the proxy joins the edge network"
 
 bootstrap = files["/opt/pterodactyl/bootstrap.sh"]
 for needle in ["p:user:make", "blueprint -i", "MCLIB_COMMIT=", "SIDEBAR_SHA256=", "DARKENATE_SHA256=", "p:node:make"]:
     assert needle in bootstrap, f"bootstrap is missing {needle}"
+assert "import /etc/caddy/sites/*.caddy" in bootstrap, "the Caddyfile must import the shared site definitions"
+assert "docker network create edge" in bootstrap, "the bootstrap must create the edge network"
 assert "${" not in bootstrap, "an unrendered Terraform interpolation leaked into the script"
 assert not any("chown -R" in str(c) for c in doc["runcmd"]), "a recursive chown would take MariaDB's datadir away from it"
 

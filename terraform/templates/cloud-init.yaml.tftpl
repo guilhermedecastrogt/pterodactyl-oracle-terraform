@@ -120,9 +120,21 @@ write_files:
           ports:
             - "80:80"
             - "443:443"
+          # The edge network lets other projects on this machine sit behind
+          # this proxy instead of fighting it for 80 and 443. Each one drops a
+          # site definition into ./sites, which the Caddyfile imports.
+          networks:
+            - default
+            - edge
           volumes:
             - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - ./sites:/etc/caddy/sites:ro
             - ./data/caddy:/data
+
+      networks:
+        edge:
+          name: edge
+          external: true
 
       volumes:
         app:
@@ -211,9 +223,20 @@ write_files:
       $NODE_FQDN {
         reverse_proxy wings:8080
       }
+
+      import /etc/caddy/sites/*.caddy
       EOF
 
-      mkdir -p data/panel/var data/panel/logs data/panel/nginx data/database data/caddy data/extensions
+      mkdir -p data/panel/var data/panel/logs data/panel/nginx data/database data/caddy data/extensions sites
+      # Site definitions are written by the projects that use this proxy,
+      # which deploy as the ubuntu user.
+      chown ubuntu:ubuntu sites
+
+      # Created here, not by Compose, so that taking the panel down never
+      # tries to delete a network other projects are still attached to.
+      docker network inspect edge >/dev/null 2>&1 \
+        || docker network create edge >/dev/null \
+        || fail "Edge network" "docker network create edge failed" "docker network ls" "create it by hand, then re-run this script"
       mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl /run/wings
 
       # --- Panel image ------------------------------------------------------------
